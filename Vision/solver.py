@@ -36,6 +36,27 @@ class CSWDictionary:
             if len(word) >= 2
         }
 
+        # Basic hash-map index used by the simple word-finder search.  Keeping
+        # words in length buckets avoids examining words that cannot fit in a
+        # requested placement.
+        self.words_by_length = {}
+
+        for word in self.words:
+            self.words_by_length.setdefault(len(word), []).append(word)
+
+        # A trie lets the solver discard a partial placement as soon as it
+        # cannot form a dictionary word.  This is substantially cheaper than
+        # trying every word in the lexicon at every board position.
+        self.trie = {}
+
+        for word in self.words:
+            node = self.trie
+
+            for letter in word:
+                node = node.setdefault(letter, {})
+
+            node[None] = True
+
         print(f"Loaded {len(self.words):,} CSW words.")
 
     def __contains__(self, word):
@@ -714,18 +735,185 @@ class ScrabbleSolver:
                     if cells & anchors:
                         yield row, col
 
+    def _cross_check(self, board, row, col, direction):
+        """Return letters that make a legal perpendicular word at a square.
+
+        ``None`` means that the square has no perpendicular neighbours, so
+        every letter remains possible.  The result is used during trie
+        traversal, before a complete candidate has been constructed.
+        """
+
+        dr, dc = DIRECTIONS[direction]
+        before = []
+        after = []
+
+        r, c = row - dr, col - dc
+        while board.inside(r, c) and board.get(r, c) != ".":
+            before.append(board.get(r, c))
+            r, c = r - dr, c - dc
+
+        r, c = row + dr, col + dc
+        while board.inside(r, c) and board.get(r, c) != ".":
+            after.append(board.get(r, c))
+            r, c = r + dr, c + dc
+
+        if not before and not after:
+            return None
+
+        prefix = "".join(reversed(before))
+        suffix = "".join(after)
+
+        return {
+            letter for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            if prefix + letter + suffix in self.dictionary
+        }
+
+    def _candidate_starts(self, board, direction):
+        """Yield starts whose preceding main-word square is empty.
+
+        A legal word cannot have a tile immediately before it.  Starting only
+        at these cells gives each possible placement one canonical traversal.
+        """
+
+        dr, dc = DIRECTIONS[direction]
+
+        if board.is_empty():
+            if direction == "H":
+                for col in range(CENTER[1] + 1):
+                    yield CENTER[0], col
+            else:
+                for row in range(CENTER[0] + 1):
+                    yield row, CENTER[1]
+            return
+
+        for row in range(SIZE):
+            for col in range(SIZE):
+                previous_row = row - dr
+                previous_col = col - dc
+
+                if (not board.inside(previous_row, previous_col)
+                        or board.get(previous_row, previous_col) == "."):
+                    yield row, col
+
+    def _trie_candidates(self, board, row, col, direction, rack, anchors,
+                         cross_checks):
+        """Generate dictionary words that can follow one start position.
+
+        Existing board letters are forced trie edges; new letters must come
+        from the rack (or a blank) and satisfy their perpendicular cross-check.
+        """
+
+        dr, dc = DIRECTIONS[direction]
+        rack_counts = Counter(rack)
+        letters = []
+
+        def visit(node, r, c, new_tiles, touches_anchor):
+            # A terminal trie node is a potential word end.  _check_move still
+            # performs the authoritative legality and scoring checks.
+            if (None in node and new_tiles and touches_anchor
+                    and len(letters) >= 2):
+                yield "".join(letters)
+
+            if not board.inside(r, c) or len(letters) == SIZE:
+                return
+
+            board_letter = board.get(r, c)
+
+            if board_letter != ".":
+                child = node.get(board_letter)
+                if child is None:
+                    return
+
+                letters.append(board_letter)
+                yield from visit(child, r + dr, c + dc, new_tiles,
+                                 touches_anchor or (r, c) in anchors)
+                letters.pop()
+                return
+
+            allowed = cross_checks.get((r, c))
+
+            for letter, child in node.items():
+                if letter is None or (allowed is not None and letter not in allowed):
+                    continue
+
+                if rack_counts[letter] > 0:
+                    rack_counts[letter] -= 1
+                    letters.append(letter)
+                    yield from visit(child, r + dr, c + dc, new_tiles + 1,
+                                     touches_anchor or (r, c) in anchors)
+                    letters.pop()
+                    rack_counts[letter] += 1
+                elif rack_counts["?"] > 0:
+                    rack_counts["?"] -= 1
+                    letters.append(letter)
+                    yield from visit(child, r + dr, c + dc, new_tiles + 1,
+                                     touches_anchor or (r, c) in anchors)
+                    letters.pop()
+                    rack_counts["?"] += 1
+
+        yield from visit(self.dictionary.trie, row, col, 0, False)
+
     # ------------------------------------------------------------
     # PUBLIC SOLVER
     # ------------------------------------------------------------
+
+    def _hash_map_moves(self, board, rack):
+        """Find moves using the basic length-to-words hash-map index.
+
+        This is deliberately straightforward: get a word bucket in O(1),
+        apply the inexpensive tile filter, then use the normal placement and
+        scoring code.  ``find_moves`` defaults to the trie strategy, which is
+        faster for a full CSW dictionary.
+        """
+
+        moves = []
+
+        for word_length, words in self.dictionary.words_by_length.items():
+            if word_length > SIZE:
+                continue
+
+            for word in words:
+                if not self._word_can_use_available_tiles(word, board, rack):
+                    continue
+
+                for direction in ("H", "V"):
+                    for row, col in self._possible_starts(
+                        board, word_length, direction
+                    ):
+                        info = self._check_move(
+                            board, word, row, col, direction, rack
+                        )
+
+                        if info is None:
+                            continue
+
+                        score = self._calculate_score(
+                            board, word, row, col, direction, info
+                        )
+
+                        moves.append(Move(
+                            word=word,
+                            row=row,
+                            col=col,
+                            direction=direction,
+                            score=score,
+                            tiles_used=info["tiles_used"],
+                            blanks=info["blanks"],
+                        ))
+
+        return moves
 
     def find_moves(
         self,
         board,
         rack,
         top_n=20,
+        algorithm="trie",
     ):
         """
         Find the highest-scoring legal moves.
+
+        ``algorithm`` can be ``"trie"`` (the default) or ``"hash_map"``.
         """
 
         rack = rack.upper().replace(" ", "")
@@ -733,61 +921,53 @@ class ScrabbleSolver:
         if len(rack) > 7:
             raise ValueError("Rack cannot contain more than 7 tiles.")
 
-        moves = []
+        if algorithm == "hash_map":
+            moves = self._hash_map_moves(board, rack)
+        elif algorithm == "trie":
+            moves = []
+            anchors = self._anchors(board) if not board.is_empty() else {CENTER}
 
-        for word in self.dictionary.words:
-
-            if len(word) > SIZE:
-                continue
-
-            # Fast global tile availability check.
-            if not self._word_can_use_available_tiles(
-                word,
-                board,
-                rack,
-            ):
-                continue
+            # Cache cross-checks once per direction.  A cross-check turns a
+            # potentially expensive completed-move rejection into a single
+            # trie branch decision.
+            cross_checks = {}
 
             for direction in ("H", "V"):
+                perpendicular = "V" if direction == "H" else "H"
 
-                for row, col in self._possible_starts(
-                    board,
-                    len(word),
-                    direction,
-                ):
+                for row in range(SIZE):
+                    for col in range(SIZE):
+                        if board.get(row, col) == ".":
+                            cross_checks[(row, col)] = self._cross_check(
+                                board, row, col, perpendicular
+                            )
 
-                    info = self._check_move(
-                        board,
-                        word,
-                        row,
-                        col,
-                        direction,
-                        rack,
-                    )
+                for row, col in self._candidate_starts(board, direction):
+                    for word in self._trie_candidates(
+                        board, row, col, direction, rack, anchors, cross_checks
+                    ):
+                        info = self._check_move(
+                            board, word, row, col, direction, rack
+                        )
 
-                    if info is None:
-                        continue
+                        if info is None:
+                            continue
 
-                    score = self._calculate_score(
-                        board,
-                        word,
-                        row,
-                        col,
-                        direction,
-                        info,
-                    )
+                        score = self._calculate_score(
+                            board, word, row, col, direction, info
+                        )
 
-                    move = Move(
-                        word=word,
-                        row=row,
-                        col=col,
-                        direction=direction,
-                        score=score,
-                        tiles_used=info["tiles_used"],
-                        blanks=info["blanks"],
-                    )
-
-                    moves.append(move)
+                        moves.append(Move(
+                            word=word,
+                            row=row,
+                            col=col,
+                            direction=direction,
+                            score=score,
+                            tiles_used=info["tiles_used"],
+                            blanks=info["blanks"],
+                        ))
+        else:
+            raise ValueError("algorithm must be 'trie' or 'hash_map'.")
 
         # Sort highest score first.
         moves.sort(
@@ -800,11 +980,12 @@ class ScrabbleSolver:
 
         return moves[:top_n]
 
-    def best_move(self, board, rack):
+    def best_move(self, board, rack, algorithm="trie"):
         moves = self.find_moves(
             board,
             rack,
             top_n=1,
+            algorithm=algorithm,
         )
 
         if not moves:
